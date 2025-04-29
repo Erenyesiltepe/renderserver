@@ -7,16 +7,20 @@ import random
 import logging
 import os
 import imagelist
-from aiohttp import web # Import aiohttp web server components
+from aiohttp import web
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Use 0.0.0.0 to bind to all interfaces, essential for Render
 WEBSOCKET_HOST = "0.0.0.0"
-# Get port from environment variable PORT, default to 10000 for Render compatibility
-# Render often defaults to 10000, but reading from os.environ is the key.
-WEBSOCKET_PORT = int(os.environ.get("PORT", 8765))
+
+# Get the main port from environment variable PORT for the WebSocket server
+WEBSOCKET_PORT = int(os.environ.get("PORT", 8765)) # Render expects the main service here
+
+# Define a *different* port for the HTTP health check
+# Choose a port unlikely to conflict, e.g., 8080 or make it configurable
+HTTP_HEALTH_PORT = int(os.environ.get("HTTP_PORT", 8080))
 
 # --- HTTP Health Check Handler ---
 async def handle_health(request):
@@ -24,20 +28,22 @@ async def handle_health(request):
     logging.info("Health check request received.")
     return web.Response(text="OK", status=200)
 
-# --- WebSocket Server Class (mostly unchanged) ---
+# --- WebSocket Server Class ---
 class WebSocketServer:
-    def __init__(self, host, port):
+    # Modify __init__ to accept both ports
+    def __init__(self, host, ws_port, http_port):
         self.host = host
-        self.port = port
+        self.ws_port = ws_port
+        self.http_port = http_port # Store the http port
         self.connected_clients = set()
-        logging.info(f"WebSocketServer initialized. Ready to listen on {self.host}:{self.port}")
+        logging.info(f"WebSocketServer initialized. WS on {self.host}:{self.ws_port}, HTTP on {self.host}:{self.http_port}")
 
+    # ... (register_client, unregister_client, onDataReceived, sendData, periodic_sender remain the same) ...
     async def register_client(self, websocket):
         self.connected_clients.add(websocket)
         logging.info(f"Client connected: {websocket.remote_address}. Total clients: {len(self.connected_clients)}")
 
     async def unregister_client(self, websocket):
-        # Use discard instead of remove to avoid KeyError if already removed
         self.connected_clients.discard(websocket)
         logging.info(f"Client disconnected: {websocket.remote_address}. Total clients: {len(self.connected_clients)}")
 
@@ -65,7 +71,6 @@ class WebSocketServer:
                     logging.debug(f"Sent message to {target_websocket.remote_address}: {message_str}")
                 except websockets.exceptions.ConnectionClosed:
                     logging.warning(f"Attempted to send to already closed connection {target_websocket.remote_address}")
-                    # Ensure removal if connection closed during send
                     await self.unregister_client(target_websocket)
                 except Exception as e:
                     logging.error(f"Error sending message to {target_websocket.remote_address}: {e}")
@@ -76,18 +81,19 @@ class WebSocketServer:
             # Broadcast to all clients - More robust error handling
             if self.connected_clients:
                 logging.debug(f"Broadcasting message to {len(self.connected_clients)} clients: {message_str}")
+                # Use list comprehension for slightly cleaner broadcast attempt
+                results = await asyncio.gather(
+                    *[client.send(message_str) for client in self.connected_clients],
+                    return_exceptions=True # Catch errors without stopping others
+                )
+                # Handle disconnections after broadcast attempt
                 disconnected_clients = set()
-                for client in self.connected_clients:
-                    try:
-                        await client.send(message_str)
-                    except websockets.exceptions.ConnectionClosed:
-                        logging.warning(f"Client {client.remote_address} disconnected during broadcast.")
-                        disconnected_clients.add(client)
-                    except Exception as e:
-                        logging.error(f"Error broadcasting to {client.remote_address}: {e}")
+                for i, result in enumerate(results):
+                    client = list(self.connected_clients)[i] # Get corresponding client
+                    if isinstance(result, Exception):
+                        logging.warning(f"Client {client.remote_address} disconnected during broadcast: {result}")
                         disconnected_clients.add(client)
 
-                # Remove disconnected clients after iteration
                 for client in disconnected_clients:
                     await self.unregister_client(client)
 
@@ -121,35 +127,80 @@ class WebSocketServer:
         finally:
             await self.unregister_client(websocket)
 
-    async def start(self):
-        """Starts both the WebSocket and HTTP servers."""
-        logging.info(f"Attempting to start servers on {self.host}:{self.port}...")
-
-        # --- Start the periodic sender ---
-        asyncio.create_task(self.periodic_sender())
-
-        # --- Configure and start the aiohttp server for health checks ---
+    # --- Split start into separate server starters ---
+    async def start_http_server(self):
+        """Starts the HTTP health check server."""
         http_app = web.Application()
-        http_app.router.add_get('/health', handle_health) # Add the health check route
+        http_app.router.add_get('/health', handle_health)
         runner = web.AppRunner(http_app)
         await runner.setup()
-        # Use the same host and port for the HTTP site
-        site = web.TCPSite(runner, self.host, self.port)
-        await site.start()
-        logging.info(f"HTTP health check server running on http://{self.host}:{self.port}/health")
+        # Use the dedicated HTTP port
+        site = web.TCPSite(runner, self.host, self.http_port)
+        try:
+            await site.start()
+            logging.info(f"HTTP health check server running on http://{self.host}:{self.http_port}/health")
+            # Keep the HTTP server running in the background
+            await asyncio.Event().wait() # Keep running until cancelled
+        except asyncio.CancelledError:
+             logging.info("HTTP server task cancelled.")
+        finally:
+            await runner.cleanup() # Clean up aiohttp resources
 
-        # --- Start the WebSocket server ---
-        # websockets.serve will run in the foreground of this coroutine
-        async with websockets.serve(self.connection_handler, self.host, self.port):
-            logging.info(f"WebSocket server running on ws://{self.host}:{self.port}")
-            await asyncio.Future()  # Keep running until interrupted
+    async def start_websocket_server(self):
+        """Starts the WebSocket server."""
+        # Use serve context manager for clean shutdown
+        async with websockets.serve(self.connection_handler, self.host, self.ws_port) as server:
+            logging.info(f"WebSocket server running on ws://{self.host}:{self.ws_port}")
+            await asyncio.Future() # Keep this coroutine running until interrupted/cancelled
+
+    async def start(self):
+        """Starts both the WebSocket and HTTP servers concurrently."""
+        logging.info(f"Attempting to start servers...")
+
+        # Start the periodic sender task
+        sender_task = asyncio.create_task(self.periodic_sender())
+        sender_task.set_name("PeriodicSender")
+
+        # Start the HTTP server task
+        http_task = asyncio.create_task(self.start_http_server())
+        http_task.set_name("HttpServer")
+
+        # Start the WebSocket server task (this one will run indefinitely in foreground of this task)
+        websocket_task = asyncio.create_task(self.start_websocket_server())
+        websocket_task.set_name("WebSocketServer")
+
+        # Wait for any of the main server tasks to complete (which they shouldn't unless there's an error)
+        # Or until an external signal (like KeyboardInterrupt) stops asyncio.run
+        done, pending = await asyncio.wait(
+            [sender_task, http_task, websocket_task],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        # Log if any task finishes unexpectedly and handle potential exceptions
+        for task in done:
+            try:
+                result = task.result() # This will raise exception if task failed
+                logging.warning(f"Task {task.get_name()} finished unexpectedly with result: {result}")
+            except asyncio.CancelledError:
+                 logging.info(f"Task {task.get_name()} was cancelled.")
+            except Exception as e:
+                logging.error(f"Task {task.get_name()} failed: {e}", exc_info=True)
+
+        # Cancel pending tasks on exit
+        logging.info("Shutting down pending tasks...")
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True) # Wait for cancellations
+        logging.info("Server shutdown complete.")
+
 
 # --- Main execution ---
 if __name__ == "__main__":
-    server = WebSocketServer(WEBSOCKET_HOST, WEBSOCKET_PORT)
+    # Pass both ports to the constructor
+    server = WebSocketServer(WEBSOCKET_HOST, WEBSOCKET_PORT, HTTP_HEALTH_PORT)
     try:
         asyncio.run(server.start())
     except KeyboardInterrupt:
         logging.info("Server stopped manually.")
     except Exception as e:
-        logging.error(f"Server failed to start or crashed: {e}", exc_info=True) # Add exc_info for more details
+        logging.error(f"Server failed to start or crashed: {e}", exc_info=True)
